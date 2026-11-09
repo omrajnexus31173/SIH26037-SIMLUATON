@@ -1,0 +1,265 @@
+// Scene — owns the Three.js renderer, camera, lighting and post-processing.
+//
+// World-space convention: the simulation works in a 2-D (x, y) plane; we map it
+// onto the ground plane as (x, 0, y) with +Y up. A smooth chase camera trails
+// the ego like the Tesla "3D driving visualisation", and an UnrealBloomPass
+// gives the ego body and the blue path their signature glow.
+
+import * as THREE from "three";
+import { EffectComposer } from "three/examples/jsm/postprocessing/EffectComposer.js";
+import { RenderPass } from "three/examples/jsm/postprocessing/RenderPass.js";
+import { UnrealBloomPass } from "three/examples/jsm/postprocessing/UnrealBloomPass.js";
+import { OutputPass } from "three/examples/jsm/postprocessing/OutputPass.js";
+import { THEME } from "./theme.ts";
+import { smoothTowards } from "../core/math.ts";
+
+export type CameraMode = "chase" | "top";
+
+export class Scene {
+  readonly scene = new THREE.Scene();
+  readonly camera: THREE.PerspectiveCamera;
+  readonly renderer: THREE.WebGLRenderer;
+  private composer: EffectComposer;
+  cameraMode: CameraMode = "chase";
+
+  // Smoothed camera target state.
+  private camPos = new THREE.Vector3(0, 30, -40);
+  private camLook = new THREE.Vector3();
+
+  constructor(canvas: HTMLCanvasElement) {
+    this.renderer = new THREE.WebGLRenderer({
+      canvas,
+      antialias: true,
+      powerPreference: "high-performance",
+    });
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    this.renderer.setSize(window.innerWidth, window.innerHeight);
+    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    this.renderer.toneMappingExposure = 1.05;
+
+    this.scene.background = this.makeGradientBackground();
+    this.nightBg = this.scene.background;
+    this.scene.fog = new THREE.Fog(THEME.fog, 80, 360);
+
+    this.camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.1, 2000);
+    this.camera.position.copy(this.camPos);
+
+    this.setupLights();
+    this.setupGround();
+    this.setupRain();
+
+    // Post-processing chain: render -> bloom -> output(color-correct).
+    this.composer = new EffectComposer(this.renderer);
+    this.composer.addPass(new RenderPass(this.scene, this.camera));
+    const bloom = new UnrealBloomPass(
+      new THREE.Vector2(window.innerWidth, window.innerHeight),
+      0.5, // strength — subtle glow, keep lane lines crisp not blown out
+      0.5, // radius
+      0.9, // threshold — only the brightest (emissive) things bloom
+    );
+    this.composer.addPass(bloom);
+    this.composer.addPass(new OutputPass());
+
+    window.addEventListener("resize", () => this.onResize());
+  }
+
+  /** Vertical navy gradient background — the Tesla "sky", never pure black. */
+  private makeGradientBackground(): THREE.Texture {
+    const canvas = document.createElement("canvas");
+    canvas.width = 4;
+    canvas.height = 512;
+    const ctx = canvas.getContext("2d")!;
+    const g = ctx.createLinearGradient(0, 0, 0, 512);
+    const hex = (c: number) => `#${c.toString(16).padStart(6, "0")}`;
+    g.addColorStop(0.0, hex(THEME.bgTop));
+    g.addColorStop(0.62, hex(THEME.background));
+    g.addColorStop(1.0, hex(THEME.bgHorizon));
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, 4, 512);
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    return tex;
+  }
+
+  private hemi!: THREE.HemisphereLight;
+  private key!: THREE.DirectionalLight;
+  private nightBg!: THREE.Texture;
+  private dayBg!: THREE.Texture;
+
+  private setupLights(): void {
+    this.hemi = new THREE.HemisphereLight(0xaebfff, 0x0a0e14, 0.75);
+    this.scene.add(this.hemi);
+
+    this.key = new THREE.DirectionalLight(0xcfe0ff, 1.0);
+    this.key.position.set(60, 120, 40);
+    this.scene.add(this.key);
+
+    const fill = new THREE.DirectionalLight(0x44557a, 0.45);
+    fill.position.set(-50, 60, -30);
+    this.scene.add(fill);
+  }
+
+  setTimeOfDay(t: "day" | "night"): void {
+    const fog = this.scene.fog as THREE.Fog;
+    if (t === "day") {
+      if (!this.dayBg) this.dayBg = gradientTexture(["#8fbce8", "#bcd7f0", "#d7e7f5"]);
+      this.scene.background = this.dayBg;
+      this.hemi.color.setHex(0xdfeaff);
+      this.hemi.intensity = 1.15;
+      this.key.color.setHex(0xfff2da);
+      this.key.intensity = 1.7;
+      this.renderer.toneMappingExposure = 1.15;
+      fog.color.setHex(0xcadcec);
+      fog.near = 120;
+      fog.far = 520;
+    } else {
+      this.scene.background = this.nightBg;
+      this.hemi.color.setHex(0xaebfff);
+      this.hemi.intensity = 0.75;
+      this.key.color.setHex(0xcfe0ff);
+      this.key.intensity = 1.0;
+      this.renderer.toneMappingExposure = 1.05;
+      fog.color.setHex(THEME.fog);
+      fog.near = 80;
+      fog.far = 360;
+    }
+  }
+
+  private setupGround(): void {
+    const ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(6000, 6000),
+      new THREE.MeshStandardMaterial({ color: THEME.ground, roughness: 1, metalness: 0 }),
+    );
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = -0.05;
+    this.scene.add(ground);
+
+    // A faint grid over the terrain gives motion & depth cues; fog fades it out.
+    const grid = new THREE.GridHelper(6000, 300, THEME.grid, THEME.grid);
+    (grid.material as THREE.Material).transparent = true;
+    (grid.material as THREE.Material).opacity = 0.55;
+    grid.position.y = -0.04;
+    this.scene.add(grid);
+  }
+
+  add(obj: THREE.Object3D): void {
+    this.scene.add(obj);
+  }
+
+  // ---- weather -----------------------------------------------------------
+  private rain!: THREE.LineSegments;
+  private rainPos!: Float32Array;
+  private rainOn = false;
+  private readonly RAIN_N = 1800;
+  private readonly RAIN_B = 70;
+  private readonly RAIN_H = 48;
+
+  private setupRain(): void {
+    const n = this.RAIN_N;
+    this.rainPos = new Float32Array(n * 6); // two vertices per drop
+    for (let i = 0; i < n; i++) {
+      const x = (Math.random() * 2 - 1) * this.RAIN_B;
+      const y = Math.random() * this.RAIN_H;
+      const z = (Math.random() * 2 - 1) * this.RAIN_B;
+      const o = i * 6;
+      this.rainPos[o] = x; this.rainPos[o + 1] = y; this.rainPos[o + 2] = z;
+      this.rainPos[o + 3] = x; this.rainPos[o + 4] = y - 1.3; this.rainPos[o + 5] = z;
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(this.rainPos, 3));
+    const mat = new THREE.LineBasicMaterial({ color: 0xaebfd8, transparent: true, opacity: 0.34 });
+    this.rain = new THREE.LineSegments(geo, mat);
+    this.rain.frustumCulled = false;
+    this.rain.visible = false;
+    this.scene.add(this.rain);
+  }
+
+  setWeather(w: "clear" | "rain" | "fog"): void {
+    const fog = this.scene.fog as THREE.Fog;
+    if (w === "rain") {
+      fog.near = 55; fog.far = 230;
+      this.renderer.toneMappingExposure = 0.92;
+      this.rainOn = true;
+    } else if (w === "fog") {
+      fog.near = 22; fog.far = 105;
+      this.renderer.toneMappingExposure = 0.98;
+      this.rainOn = false;
+    } else {
+      fog.near = 80; fog.far = 360;
+      this.renderer.toneMappingExposure = 1.05;
+      this.rainOn = false;
+    }
+    this.rain.visible = this.rainOn;
+  }
+
+  updateWeather(dt: number, egoX: number, egoY: number): void {
+    if (!this.rainOn) return;
+    this.rain.position.set(egoX, 0, egoY);
+    const fall = 34 * dt;
+    const p = this.rainPos;
+    for (let i = 0; i < this.RAIN_N; i++) {
+      const o = i * 6;
+      let y = p[o + 1] - fall;
+      if (y < -2) y += this.RAIN_H;
+      p[o + 1] = y;
+      p[o + 4] = y - 1.3;
+    }
+    (this.rain.geometry.attributes.position as THREE.BufferAttribute).needsUpdate = true;
+  }
+
+  /** Reposition the chase/top camera to follow the ego smoothly. */
+  updateCamera(egoX: number, egoY: number, egoYaw: number, dt: number): void {
+    const fx = Math.cos(egoYaw);
+    const fz = Math.sin(egoYaw);
+    let targetPos: THREE.Vector3;
+    let targetLook: THREE.Vector3;
+
+    if (this.cameraMode === "chase") {
+      // Behind and above, looking ahead of the car.
+      targetPos = new THREE.Vector3(egoX - fx * 16, 9, egoY - fz * 16);
+      targetLook = new THREE.Vector3(egoX + fx * 12, 1.5, egoY + fz * 12);
+    } else {
+      targetPos = new THREE.Vector3(egoX - fx * 2, 60, egoY - fz * 2);
+      targetLook = new THREE.Vector3(egoX + fx * 8, 0, egoY + fz * 8);
+    }
+
+    const rate = 6;
+    this.camPos.x = smoothTowards(this.camPos.x, targetPos.x, rate, dt);
+    this.camPos.y = smoothTowards(this.camPos.y, targetPos.y, rate, dt);
+    this.camPos.z = smoothTowards(this.camPos.z, targetPos.z, rate, dt);
+    this.camLook.x = smoothTowards(this.camLook.x, targetLook.x, rate, dt);
+    this.camLook.y = smoothTowards(this.camLook.y, targetLook.y, rate, dt);
+    this.camLook.z = smoothTowards(this.camLook.z, targetLook.z, rate, dt);
+
+    this.camera.position.copy(this.camPos);
+    this.camera.lookAt(this.camLook);
+  }
+
+  render(): void {
+    this.composer.render();
+  }
+
+  private onResize(): void {
+    const w = window.innerWidth;
+    const h = window.innerHeight;
+    this.camera.aspect = w / h;
+    this.camera.updateProjectionMatrix();
+    this.renderer.setSize(w, h);
+    this.composer.setSize(w, h);
+  }
+}
+
+/** Build a vertical gradient background texture from CSS colour stops. */
+function gradientTexture(colors: string[]): THREE.Texture {
+  const canvas = document.createElement("canvas");
+  canvas.width = 4;
+  canvas.height = 512;
+  const ctx = canvas.getContext("2d")!;
+  const g = ctx.createLinearGradient(0, 0, 0, 512);
+  colors.forEach((c, i) => g.addColorStop(i / (colors.length - 1), c));
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, 4, 512);
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
